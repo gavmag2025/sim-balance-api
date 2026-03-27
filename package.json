@@ -1,0 +1,18 @@
+{
+  "name": "sim-balance-api",
+  "version": "1.0.0",
+  "description": "Satellite SIM card balance checker API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "puppeteer": "^21.5.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
