@@ -232,7 +232,7 @@ async function lookupSIM(iccid) {
 
   // Press Enter to submit the filter and wait for the grid to reload
   await sessionPage.keyboard.press('Enter');
-  await sleep(3000); // let the ASP.NET grid re-render
+  await sleep(5000); // let the ASP.NET grid re-render
 
   // ── Extract results from the table ───────────────────────────────────────────
   const result = await sessionPage.evaluate(() => {
@@ -249,7 +249,7 @@ async function lookupSIM(iccid) {
     if (!dataRow) return { found: false, reason: 'No data rows found' };
 
     const values = Array.from(dataRow.querySelectorAll('td')).map(td => td.textContent.trim());
-    console.log('Data row values:', JSON.stringify(values));
+    return { found: true, _values: values, iccid: '', msisdn: '', product: '', status: 'debug', location: '', lastUsed: '', expiry: '', balance: '', planName: '' };
 
     // ── Pattern-based extraction (immune to colspan/rowspan header layout) ──
 
@@ -287,7 +287,8 @@ async function lookupSIM(iccid) {
     return { found: true, iccid, msisdn, product, status, location, lastUsed, expiry, balance, planName };
   });
 
-  console.log('[lookup] Raw result:', JSON.stringify(result));
+  console.log('[lookup] Raw cell values:', JSON.stringify(result._values));
+  console.log('[lookup] Total cells found:', result._values ? result._values.length : 0);
   return result;
 }
 
