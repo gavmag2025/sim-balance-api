@@ -160,7 +160,6 @@ async function lookupSIM(iccid) {
   console.log(`[lookup] Navigating to SIM cards page for ICCID: ${iccid}`);
   await sessionPage.goto(PORTAL_SIMCARDS, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-  // If session expired we land back on login page
   if (sessionPage.url().toLowerCase().includes('login')) {
     console.log('[lookup] Session expired – re-logging in...');
     isLoggedIn = false;
@@ -168,132 +167,73 @@ async function lookupSIM(iccid) {
     await sessionPage.goto(PORTAL_SIMCARDS, { waitUntil: 'domcontentloaded', timeout: 60000 });
   }
 
-  // Wait for the data table to appear
-  await sessionPage.waitForSelector('table', { timeout: 15000 });
+  // Wait for the DevExpress grid filter input to appear
+  // Exact selector from inspecting the page: input id contains "DXFREditorcol0"
+  await sessionPage.waitForSelector('input[id*="DXFREditorcol0"]', { timeout: 15000 });
+  console.log('[lookup] Grid filter input found');
 
-  // ── Find and fill the ICCID filter input ─────────────────────────────────────
-  // Strategy: scan all <tr>s for one containing <input type="text"> and whose
-  // cell index matches the column that has "ICCID" in a header row above it.
-  // Find the ICCID filter input.
-  // Strategy: identify the grid header row by finding a row that contains MULTIPLE
-  // known column names (ICCID + Status + Product). The autocomplete dropdown will
-  // never have all three in the same row, so this uniquely identifies the real grid.
-  const filterHandle = await sessionPage.evaluateHandle(() => {
-    for (const table of document.querySelectorAll('table')) {
-      for (const tr of table.querySelectorAll('tr')) {
-        const cells = Array.from(tr.querySelectorAll('td, th'));
-        const texts = cells.map(c => c.textContent.trim());
+  // Clear the filter and type the ICCID
+  const filterInput = await sessionPage.$('input[id*="DXFREditorcol0"]');
+  await filterInput.click({ clickCount: 3 });
+  await filterInput.type(iccid, { delay: 40 });
 
-        // Must have ICCID, Status, AND Product in the same row = real grid header
-        if (!texts.includes('ICCID') || !texts.includes('Status') || !texts.includes('Product')) continue;
-
-        const iccidIndex = texts.indexOf('ICCID');
-        console.log('Found grid header row, ICCID at index:', iccidIndex);
-
-        // Walk sibling rows to find the filter row (first row after header with inputs)
-        let sibling = tr.nextElementSibling;
-        while (sibling) {
-          const inputs = sibling.querySelectorAll('input[type="text"]');
-          if (inputs.length > 0) {
-            // Try to get input at the same column index as ICCID
-            const sibCells = Array.from(sibling.querySelectorAll('td, th'));
-            if (iccidIndex < sibCells.length) {
-              const inp = sibCells[iccidIndex].querySelector('input[type="text"]') ||
-                          sibCells[iccidIndex].querySelector('input');
-              if (inp) return inp;
-            }
-            // Fallback: return the first input in the filter row
-            return inputs[0];
-          }
-          sibling = sibling.nextElementSibling;
-        }
+  // Trigger the DevExpress filter change event then press Enter
+  await sessionPage.evaluate(() => {
+    const input = document.querySelector('input[id*="DXFREditorcol0"]');
+    if (input) {
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      if (typeof ASPx !== 'undefined' && input.id) {
+        const baseId = input.id.replace('_I', '');
+        try { ASPx.EValueChanged(baseId); } catch(e) {}
       }
     }
-    return null;
   });
 
-  const filterElement = filterHandle.asElement();
-  if (!filterElement) {
-    throw new Error('Could not find ICCID filter input (grid header row with ICCID+Status+Product not found)');
-  }
-
-  console.log('[lookup] Found ICCID filter input via grid header detection');
-  await filterElement.click({ clickCount: 3 });
-  await filterElement.type(iccid, { delay: 30 });
   await sessionPage.keyboard.press('Enter');
-  await sleep(5000); // let the ASP.NET grid re-render
+  await sleep(5000); // wait for DevExpress grid to reload
 
-  // ── Extract results from the table ───────────────────────────────────────────
+  // ── Extract results using exact DevExpress class selectors ──────────────────
   const result = await sessionPage.evaluate(() => {
-    // Find the real data grid — a table with a header row containing ICCID+Status+Product
-    let dataTable = null;
-    for (const table of document.querySelectorAll('table')) {
-      for (const tr of table.querySelectorAll('tr')) {
-        const texts = Array.from(tr.querySelectorAll('td, th')).map(c => c.textContent.trim());
-        if (texts.includes('ICCID') && texts.includes('Status') && texts.includes('Product')) {
-          dataTable = table; break;
-        }
-      }
-      if (dataTable) break;
-    }
-    if (!dataTable) return { found: false, reason: 'Data grid not found (no header row with ICCID+Status+Product)' };
-
-    const rows = Array.from(dataTable.querySelectorAll('tr'));
-
-    // Find the first data row: no <th>, no <input>/<select>, many columns, no placeholder text
+    // Data rows in a DevExpress grid have cells with class "dxgv"
+    // Find the first row with 10+ dxgv cells that isn't a "no data" row
     let dataRow = null;
-    for (const row of rows) {
-      if (row.querySelector('th, input, select')) continue;
-      const cells = row.querySelectorAll('td');
+    for (const row of document.querySelectorAll('tr')) {
+      const cells = row.querySelectorAll('td.dxgv');
+      if (cells.length < 10) continue;
       const text = row.textContent.trim();
-      if (cells.length >= 10 && !text.includes('No data') && !text.includes('Loading')) {
-        dataRow = row; break;
-      }
+      if (text.includes('No data') || text.includes('Loading')) continue;
+      dataRow = row;
+      break;
     }
 
-    if (!dataRow) return { found: false, reason: 'No data rows found' };
+    if (!dataRow) return { found: false, reason: 'No dxgv data row found after filter' };
 
-    const values = Array.from(dataRow.querySelectorAll('td')).map(td => td.textContent.trim());
-    return { found: true, _values: values, iccid: '', msisdn: '', product: '', status: 'debug', location: '', lastUsed: '', expiry: '', balance: '', planName: '' };
+    // ── Exact cell extraction ──
+    // Expiry: the last td.dxgv — it has style="border-right-width:0px" (no right border = last col)
+    const expiryCell = dataRow.querySelector('td.dxgv[style*="border-right-width:0px"]');
+    const expiry = expiryCell ? expiryCell.textContent.trim() : 'N/A';
 
-    // ── Pattern-based extraction (immune to colspan/rowspan header layout) ──
+    // Balance: td.dxgv with align="right" that is immediately before the expiry cell
+    const balanceCell = expiryCell ? expiryCell.previousElementSibling : null;
+    const balance = balanceCell ? balanceCell.textContent.trim() : '0';
 
-    // ICCID: 17–22 digit string
-    const iccid = values.find(v => /^\d{17,22}$/.test(v)) || '';
+    // All cell values for pattern-matching other fields
+    const values = Array.from(dataRow.querySelectorAll('td.dxgv')).map(c => c.textContent.trim());
+    console.log('[extract] values:', JSON.stringify(values));
 
-    // MSISDN: 10–15 digits, different from ICCID
-    const msisdn = values.find(v => /^\d{10,16}$/.test(v) && v !== iccid) || '';
-
-    // Status: exact known values
-    const status = values.find(v =>
-      /^(Activated|Expired|Not Activated|Active|Inactive|Suspended)$/i.test(v)
-    ) || 'Unknown';
-
-    // Product: 2–6 uppercase letters (e.g. GSPS, BGAN)
-    const product = values.find(v => /^[A-Z]{2,6}$/.test(v)) || '';
-
-    // Location: 2–3 uppercase letter country code, different from product
+    const iccid    = values.find(v => /^\d{17,22}$/.test(v)) || '';
+    const msisdn   = values.find(v => /^\d{10,16}$/.test(v) && v !== iccid) || '';
+    const status   = values.find(v => /^(Activated|Expired|Not Activated|Active|Inactive|Suspended)$/i.test(v)) || 'Unknown';
+    const product  = values.find(v => /^[A-Z]{2,6}$/.test(v)) || '';
     const location = values.find(v => /^[A-Z]{2,3}$/.test(v) && v !== product) || '';
-
-    // All dates in the row (format: "11 Jul 2025")
-    const dates = values.filter(v => /^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/.test(v));
+    const dates    = values.filter(v => /^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/.test(v));
     const lastUsed = dates[0] || 'N/A';
-    const expiry   = dates[dates.length - 1] || 'N/A'; // Expiry is always the last date
-
-    // Balance: decimal number (e.g. 47.25) in the last 5 cells (Prepay section is at the end)
-    const lastFive = values.slice(-5);
-    const balance  = lastFive.find(v => /^\d+\.\d{2}$/.test(v)) || '0';
-
-    // Plan name: text containing "Plan" or "Prepay"
-    const planName = values.find(v =>
-      v.length > 5 && (v.toLowerCase().includes('plan') || v.toLowerCase().includes('prepay'))
-    ) || '';
+    const planName = values.find(v => v.length > 5 && (v.toLowerCase().includes('plan') || v.toLowerCase().includes('prepay'))) || '';
 
     return { found: true, iccid, msisdn, product, status, location, lastUsed, expiry, balance, planName };
   });
 
-  console.log('[lookup] Raw cell values:', JSON.stringify(result._values));
-  console.log('[lookup] Total cells found:', result._values ? result._values.length : 0);
+  console.log('[lookup] Result:', JSON.stringify(result));
   return result;
 }
 
