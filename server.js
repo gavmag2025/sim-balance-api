@@ -174,83 +174,54 @@ async function lookupSIM(iccid) {
   // ── Find and fill the ICCID filter input ─────────────────────────────────────
   // Strategy: scan all <tr>s for one containing <input type="text"> and whose
   // cell index matches the column that has "ICCID" in a header row above it.
-  const filled = await sessionPage.evaluate((iccidValue) => {
-    // Find the main data table (largest table on the page, excludes nav/dropdowns)
-    const tables = Array.from(document.querySelectorAll('table'));
-    let dataTable = null;
-    let maxCells = 0;
-    for (const t of tables) {
-      const count = t.querySelectorAll('td, th').length;
-      if (count > maxCells) { maxCells = count; dataTable = t; }
-    }
-    if (!dataTable) return { found: false, reason: 'No data table found' };
+  // Find the ICCID filter input using element handles.
+  // We search for a table that has "ICCID" as a <th> (header cell) — this is the real
+  // data grid, not the "Find Anything" autocomplete dropdown which uses <td> only.
+  const filterHandle = await sessionPage.evaluateHandle(() => {
+    for (const table of document.querySelectorAll('table')) {
+      // Only consider tables whose headers use <th> and contain "ICCID"
+      const ths = Array.from(table.querySelectorAll('th'));
+      const iccidTh = ths.find(th => th.textContent.trim() === 'ICCID');
+      if (!iccidTh) continue;
 
-    const rows = Array.from(dataTable.querySelectorAll('tr'));
-
-    // Find the column index of "ICCID" within the data table only
-    let iccidColIndex = -1;
-    for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll('th, td'));
-      for (let i = 0; i < cells.length; i++) {
-        if (cells[i].textContent.trim() === 'ICCID') {
-          iccidColIndex = i;
-          break;
-        }
-      }
-      if (iccidColIndex >= 0) break;
-    }
-
-    if (iccidColIndex < 0) return { found: false, reason: 'ICCID column not found in data table' };
-
-    // Find filter row: the row inside the data table that has an input in the ICCID column
-    for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll('td, th'));
-      if (iccidColIndex < cells.length) {
-        const input = cells[iccidColIndex].querySelector('input[type="text"]') ||
-                      cells[iccidColIndex].querySelector('input');
-        if (input) {
-          input.focus();
-          input.value = iccidValue;
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-          return { found: true, method: 'data-table', colIndex: iccidColIndex };
-        }
+      // Found the real grid. Walk its rows to find the filter input row.
+      for (const tr of table.querySelectorAll('tr')) {
+        if (tr.querySelector('th')) continue; // skip header rows
+        const inp = tr.querySelector('input[type="text"]');
+        if (inp) return inp; // first text input in first non-header row = ICCID filter
       }
     }
+    return null;
+  });
 
-    return { found: false, reason: 'Filter input not found in data table' };
-  }, iccid);
-
-  console.log('[lookup] Filter fill result:', filled);
-
-  if (!filled.found) {
-    throw new Error(`Could not find ICCID filter input on the page. Reason: ${filled.reason}`);
+  const filterElement = filterHandle.asElement();
+  if (!filterElement) {
+    throw new Error('Could not find ICCID filter input (no table with <th>ICCID</th> found)');
   }
 
-  // Press Enter to submit the filter and wait for the grid to reload
+  console.log('[lookup] Found ICCID filter input via <th> method');
+  await filterElement.click({ clickCount: 3 }); // select any existing text
+  await filterElement.type(iccid, { delay: 30 });
   await sessionPage.keyboard.press('Enter');
   await sleep(5000); // let the ASP.NET grid re-render
 
   // ── Extract results from the table ───────────────────────────────────────────
   const result = await sessionPage.evaluate(() => {
-    // Use the same main data table (largest on the page)
-    const tables = Array.from(document.querySelectorAll('table'));
+    // Find the real data grid — the table with <th> headers including "ICCID"
     let dataTable = null;
-    let maxCells = 0;
-    for (const t of tables) {
-      const count = t.querySelectorAll('td, th').length;
-      if (count > maxCells) { maxCells = count; dataTable = t; }
+    for (const table of document.querySelectorAll('table')) {
+      const ths = Array.from(table.querySelectorAll('th'));
+      if (ths.some(th => th.textContent.trim() === 'ICCID')) { dataTable = table; break; }
     }
-    if (!dataTable) return { found: false, reason: 'No data table found' };
+    if (!dataTable) return { found: false, reason: 'Data grid not found' };
 
     const rows = Array.from(dataTable.querySelectorAll('tr'));
 
-    // Find the first data row: no <th>, no <input>/<select>, and has many columns
+    // Find the first data row: no <th>, no <input>/<select>, many columns, no placeholder text
     let dataRow = null;
     for (const row of rows) {
       if (row.querySelector('th, input, select')) continue;
       const cells = row.querySelectorAll('td');
-      // Must have real data — skip "No data" or loading rows
       const text = row.textContent.trim();
       if (cells.length >= 10 && !text.includes('No data') && !text.includes('Loading')) {
         dataRow = row; break;
