@@ -238,89 +238,53 @@ async function lookupSIM(iccid) {
   const result = await sessionPage.evaluate(() => {
     const rows = Array.from(document.querySelectorAll('tr'));
 
-    // Find the sub-header row that contains "Balance" and "Expiry"
-    // (The table has merged headers with a sub-row listing individual column names)
-    let subHeaderRow = null;
-    let colMap = {};   // column name → cell index
-
-    for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll('th, td'));
-      const texts = cells.map(c => c.textContent.trim());
-
-      if (texts.includes('Balance') || texts.includes('Expiry')) {
-        subHeaderRow = row;
-        texts.forEach((t, i) => { if (t) colMap[t] = i; });
-        break;
-      }
-    }
-
-    if (!subHeaderRow) {
-      // Try to find the most-column header row as fallback
-      let maxCols = 0;
-      for (const row of rows) {
-        const cells = row.querySelectorAll('th');
-        if (cells.length > maxCols) { maxCols = cells.length; subHeaderRow = row; }
-      }
-      if (subHeaderRow) {
-        Array.from(subHeaderRow.querySelectorAll('th')).forEach((th, i) => {
-          if (th.textContent.trim()) colMap[th.textContent.trim()] = i;
-        });
-      }
-    }
-
-    if (!subHeaderRow) return { found: false, reason: 'Could not find column headers' };
-
-    // Find the first data row AFTER the filter row
-    // Filter row = a <tr> that contains <input> elements
-    let passedFilterRow = false;
+    // Find the first data row: no <th>, no <input>/<select>, and has many columns
     let dataRow = null;
-
-    let foundSubHeader = false;
     for (const row of rows) {
-      if (row === subHeaderRow) { foundSubHeader = true; continue; }
-      if (!foundSubHeader) continue;
-
-      // Skip rows that are filter rows (contain inputs)
-      if (row.querySelector('input')) { passedFilterRow = true; continue; }
-      if (!passedFilterRow) continue;
-
+      if (row.querySelector('th, input, select')) continue;
       const cells = row.querySelectorAll('td');
-      if (cells.length > 3) {
-        dataRow = row;
-        break;
-      }
+      if (cells.length >= 10) { dataRow = row; break; }
     }
 
-    if (!dataRow) return { found: false, reason: 'No data rows found after filter' };
+    if (!dataRow) return { found: false, reason: 'No data rows found' };
 
-    const dataCells = Array.from(dataRow.querySelectorAll('td'));
+    const values = Array.from(dataRow.querySelectorAll('td')).map(td => td.textContent.trim());
+    console.log('Data row values:', JSON.stringify(values));
 
-    // Helper to get a cell value by column name
-    function col(name) {
-      const idx = colMap[name];
-      return (idx !== undefined && dataCells[idx]) ? dataCells[idx].textContent.trim() : null;
-    }
+    // ── Pattern-based extraction (immune to colspan/rowspan header layout) ──
 
-    // Also try getting the last two cells for Balance/Expiry (they're always last)
-    const lastTwo = dataCells.slice(-2);
+    // ICCID: 17–22 digit string
+    const iccid = values.find(v => /^\d{17,22}$/.test(v)) || '';
 
-    return {
-      found: true,
-      iccid:            col('ICCID'),
-      msisdn:           col('Master MSISDN'),
-      product:          col('Product'),
-      status:           col('Status'),
-      name:             col('Name'),
-      lastUsed:         col('Last Used'),
-      location:         col('Location'),
-      subscriptionName: col('Name') || col('Subscription'),
-      planId:           col('ID'),
-      planName:         col('Name.1') || col('Name'),
-      balance:          col('Balance') || lastTwo[0]?.textContent.trim() || null,
-      expiry:           col('Expiry')  || lastTwo[1]?.textContent.trim() || null,
-      totalColumns:     dataCells.length,
-      colMap:           colMap
-    };
+    // MSISDN: 10–15 digits, different from ICCID
+    const msisdn = values.find(v => /^\d{10,16}$/.test(v) && v !== iccid) || '';
+
+    // Status: exact known values
+    const status = values.find(v =>
+      /^(Activated|Expired|Not Activated|Active|Inactive|Suspended)$/i.test(v)
+    ) || 'Unknown';
+
+    // Product: 2–6 uppercase letters (e.g. GSPS, BGAN)
+    const product = values.find(v => /^[A-Z]{2,6}$/.test(v)) || '';
+
+    // Location: 2–3 uppercase letter country code, different from product
+    const location = values.find(v => /^[A-Z]{2,3}$/.test(v) && v !== product) || '';
+
+    // All dates in the row (format: "11 Jul 2025")
+    const dates = values.filter(v => /^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/.test(v));
+    const lastUsed = dates[0] || 'N/A';
+    const expiry   = dates[dates.length - 1] || 'N/A'; // Expiry is always the last date
+
+    // Balance: decimal number (e.g. 47.25) in the last 5 cells (Prepay section is at the end)
+    const lastFive = values.slice(-5);
+    const balance  = lastFive.find(v => /^\d+\.\d{2}$/.test(v)) || '0';
+
+    // Plan name: text containing "Plan" or "Prepay"
+    const planName = values.find(v =>
+      v.length > 5 && (v.toLowerCase().includes('plan') || v.toLowerCase().includes('prepay'))
+    ) || '';
+
+    return { found: true, iccid, msisdn, product, status, location, lastUsed, expiry, balance, planName };
   });
 
   console.log('[lookup] Raw result:', JSON.stringify(result));
