@@ -174,21 +174,39 @@ async function lookupSIM(iccid) {
   // ── Find and fill the ICCID filter input ─────────────────────────────────────
   // Strategy: scan all <tr>s for one containing <input type="text"> and whose
   // cell index matches the column that has "ICCID" in a header row above it.
-  // Find the ICCID filter input using element handles.
-  // We search for a table that has "ICCID" as a <th> (header cell) — this is the real
-  // data grid, not the "Find Anything" autocomplete dropdown which uses <td> only.
+  // Find the ICCID filter input.
+  // Strategy: identify the grid header row by finding a row that contains MULTIPLE
+  // known column names (ICCID + Status + Product). The autocomplete dropdown will
+  // never have all three in the same row, so this uniquely identifies the real grid.
   const filterHandle = await sessionPage.evaluateHandle(() => {
     for (const table of document.querySelectorAll('table')) {
-      // Only consider tables whose headers use <th> and contain "ICCID"
-      const ths = Array.from(table.querySelectorAll('th'));
-      const iccidTh = ths.find(th => th.textContent.trim() === 'ICCID');
-      if (!iccidTh) continue;
-
-      // Found the real grid. Walk its rows to find the filter input row.
       for (const tr of table.querySelectorAll('tr')) {
-        if (tr.querySelector('th')) continue; // skip header rows
-        const inp = tr.querySelector('input[type="text"]');
-        if (inp) return inp; // first text input in first non-header row = ICCID filter
+        const cells = Array.from(tr.querySelectorAll('td, th'));
+        const texts = cells.map(c => c.textContent.trim());
+
+        // Must have ICCID, Status, AND Product in the same row = real grid header
+        if (!texts.includes('ICCID') || !texts.includes('Status') || !texts.includes('Product')) continue;
+
+        const iccidIndex = texts.indexOf('ICCID');
+        console.log('Found grid header row, ICCID at index:', iccidIndex);
+
+        // Walk sibling rows to find the filter row (first row after header with inputs)
+        let sibling = tr.nextElementSibling;
+        while (sibling) {
+          const inputs = sibling.querySelectorAll('input[type="text"]');
+          if (inputs.length > 0) {
+            // Try to get input at the same column index as ICCID
+            const sibCells = Array.from(sibling.querySelectorAll('td, th'));
+            if (iccidIndex < sibCells.length) {
+              const inp = sibCells[iccidIndex].querySelector('input[type="text"]') ||
+                          sibCells[iccidIndex].querySelector('input');
+              if (inp) return inp;
+            }
+            // Fallback: return the first input in the filter row
+            return inputs[0];
+          }
+          sibling = sibling.nextElementSibling;
+        }
       }
     }
     return null;
@@ -196,24 +214,29 @@ async function lookupSIM(iccid) {
 
   const filterElement = filterHandle.asElement();
   if (!filterElement) {
-    throw new Error('Could not find ICCID filter input (no table with <th>ICCID</th> found)');
+    throw new Error('Could not find ICCID filter input (grid header row with ICCID+Status+Product not found)');
   }
 
-  console.log('[lookup] Found ICCID filter input via <th> method');
-  await filterElement.click({ clickCount: 3 }); // select any existing text
+  console.log('[lookup] Found ICCID filter input via grid header detection');
+  await filterElement.click({ clickCount: 3 });
   await filterElement.type(iccid, { delay: 30 });
   await sessionPage.keyboard.press('Enter');
   await sleep(5000); // let the ASP.NET grid re-render
 
   // ── Extract results from the table ───────────────────────────────────────────
   const result = await sessionPage.evaluate(() => {
-    // Find the real data grid — the table with <th> headers including "ICCID"
+    // Find the real data grid — a table with a header row containing ICCID+Status+Product
     let dataTable = null;
     for (const table of document.querySelectorAll('table')) {
-      const ths = Array.from(table.querySelectorAll('th'));
-      if (ths.some(th => th.textContent.trim() === 'ICCID')) { dataTable = table; break; }
+      for (const tr of table.querySelectorAll('tr')) {
+        const texts = Array.from(tr.querySelectorAll('td, th')).map(c => c.textContent.trim());
+        if (texts.includes('ICCID') && texts.includes('Status') && texts.includes('Product')) {
+          dataTable = table; break;
+        }
+      }
+      if (dataTable) break;
     }
-    if (!dataTable) return { found: false, reason: 'Data grid not found' };
+    if (!dataTable) return { found: false, reason: 'Data grid not found (no header row with ICCID+Status+Product)' };
 
     const rows = Array.from(dataTable.querySelectorAll('tr'));
 
