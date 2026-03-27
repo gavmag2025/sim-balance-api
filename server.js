@@ -175,9 +175,19 @@ async function lookupSIM(iccid) {
   // Strategy: scan all <tr>s for one containing <input type="text"> and whose
   // cell index matches the column that has "ICCID" in a header row above it.
   const filled = await sessionPage.evaluate((iccidValue) => {
-    const rows = Array.from(document.querySelectorAll('tr'));
+    // Find the main data table (largest table on the page, excludes nav/dropdowns)
+    const tables = Array.from(document.querySelectorAll('table'));
+    let dataTable = null;
+    let maxCells = 0;
+    for (const t of tables) {
+      const count = t.querySelectorAll('td, th').length;
+      if (count > maxCells) { maxCells = count; dataTable = t; }
+    }
+    if (!dataTable) return { found: false, reason: 'No data table found' };
 
-    // Step 1: find the column index of "ICCID" in a header row
+    const rows = Array.from(dataTable.querySelectorAll('tr'));
+
+    // Find the column index of "ICCID" within the data table only
     let iccidColIndex = -1;
     for (const row of rows) {
       const cells = Array.from(row.querySelectorAll('th, td'));
@@ -190,22 +200,9 @@ async function lookupSIM(iccid) {
       if (iccidColIndex >= 0) break;
     }
 
-    if (iccidColIndex < 0) {
-      // Fallback: just use the first text input in any filter-looking row
-      for (const row of rows) {
-        const inputs = row.querySelectorAll('input[type="text"]');
-        if (inputs.length > 0) {
-          inputs[0].focus();
-          inputs[0].value = iccidValue;
-          inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
-          inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
-          return { found: true, method: 'fallback' };
-        }
-      }
-      return { found: false, reason: 'ICCID column not found' };
-    }
+    if (iccidColIndex < 0) return { found: false, reason: 'ICCID column not found in data table' };
 
-    // Step 2: find a row that has an <input> in the ICCID column position
+    // Find filter row: the row inside the data table that has an input in the ICCID column
     for (const row of rows) {
       const cells = Array.from(row.querySelectorAll('td, th'));
       if (iccidColIndex < cells.length) {
@@ -216,12 +213,12 @@ async function lookupSIM(iccid) {
           input.value = iccidValue;
           input.dispatchEvent(new Event('input', { bubbles: true }));
           input.dispatchEvent(new Event('change', { bubbles: true }));
-          return { found: true, method: 'column-match', colIndex: iccidColIndex };
+          return { found: true, method: 'data-table', colIndex: iccidColIndex };
         }
       }
     }
 
-    return { found: false, reason: 'Filter input not found at ICCID column' };
+    return { found: false, reason: 'Filter input not found in data table' };
   }, iccid);
 
   console.log('[lookup] Filter fill result:', filled);
@@ -236,14 +233,28 @@ async function lookupSIM(iccid) {
 
   // ── Extract results from the table ───────────────────────────────────────────
   const result = await sessionPage.evaluate(() => {
-    const rows = Array.from(document.querySelectorAll('tr'));
+    // Use the same main data table (largest on the page)
+    const tables = Array.from(document.querySelectorAll('table'));
+    let dataTable = null;
+    let maxCells = 0;
+    for (const t of tables) {
+      const count = t.querySelectorAll('td, th').length;
+      if (count > maxCells) { maxCells = count; dataTable = t; }
+    }
+    if (!dataTable) return { found: false, reason: 'No data table found' };
+
+    const rows = Array.from(dataTable.querySelectorAll('tr'));
 
     // Find the first data row: no <th>, no <input>/<select>, and has many columns
     let dataRow = null;
     for (const row of rows) {
       if (row.querySelector('th, input, select')) continue;
       const cells = row.querySelectorAll('td');
-      if (cells.length >= 10) { dataRow = row; break; }
+      // Must have real data — skip "No data" or loading rows
+      const text = row.textContent.trim();
+      if (cells.length >= 10 && !text.includes('No data') && !text.includes('Loading')) {
+        dataRow = row; break;
+      }
     }
 
     if (!dataRow) return { found: false, reason: 'No data rows found' };
