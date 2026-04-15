@@ -312,14 +312,42 @@ async function lookupCDRs(iccid, period) {
     await sleep(6000);
   }
 
-  // Extract CDR rows from the grid
+  // Wait for grid to finish loading — poll until Loading disappears
+  console.log('[cdrs] Waiting for grid to finish rendering...');
+  for (let i = 0; i < 15; i++) {
+    await sleep(2000);
+    const stillLoading = await sessionPage.evaluate(() => {
+      const cells = document.querySelectorAll('td.dxgv');
+      for (const c of cells) {
+        if (c.innerText && c.innerText.includes('Loading')) return true;
+      }
+      return false;
+    });
+    if (!stillLoading) { console.log(`[cdrs] Grid ready after ${(i+1)*2}s`); break; }
+    console.log(`[cdrs] Still loading... ${(i+1)*2}s`);
+  }
+
+  // Extract CDR rows — filter out script/comment/calendar content
   const rows = await sessionPage.evaluate(() => {
     const result = [];
     for (const row of document.querySelectorAll('tr')) {
       const cells = Array.from(row.querySelectorAll('td.dxgv'));
       if (cells.length < 8) continue;
-      const values = cells.map(c => c.textContent.trim());
-      if (!values[0] || values[0].includes('No data') || values[0].includes('Loading')) continue;
+
+      // Get clean text — skip script tags inside cells
+      const values = cells.map(c => {
+        // Clone and remove all script/style children
+        const clone = c.cloneNode(true);
+        clone.querySelectorAll('script,style').forEach(el => el.remove());
+        return clone.innerText ? clone.innerText.trim().replace(/\s+/g, ' ') : clone.textContent.trim().replace(/\s+/g, ' ');
+      });
+
+      // Skip rows containing JS, HTML comments, calendar widgets, or loading
+      const joined = values.join('|');
+      if (joined.includes('ASPx') || joined.includes('<!--') || joined.includes('function(')) continue;
+      if (joined.includes('Loading') || joined.includes('SunMon') || joined.includes('MonTue')) continue;
+      if (!values[0] || values[0].length < 2) continue;
+
       result.push({
         iccid:      values[0]  || '',
         product:    values[1]  || '',
@@ -347,6 +375,7 @@ async function lookupCDRs(iccid, period) {
   });
 
   console.log(`[cdrs] Found ${rows.length} CDR rows`);
+  if (rows.length > 0) console.log('[cdrs] First row:', JSON.stringify(rows[0]));
   return { found: true, rows };
 }
 
