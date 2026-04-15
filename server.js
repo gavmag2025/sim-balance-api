@@ -217,76 +217,132 @@ async function lookupCDRs(iccid, period) {
     await sessionPage.goto(cdrUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   }
 
-  // Wait for billing period dropdown
-  await sessionPage.waitForSelector('select', { timeout: 15000 });
-  await sleep(2000);
+  // Wait for page to settle
+  await sleep(4000);
 
-  // Find and select the billing period dropdown
-  const periodSelected = await sessionPage.evaluate((period) => {
-    // Find all selects and look for the one with period-like options (YYYYMM format)
+  // The billing period is a DevExpress combobox — find it and select the period
+  // It renders as either a <select> OR a DevExpress custom dropdown
+  const periodResult = await sessionPage.evaluate((period) => {
+    // Try native select first
     const selects = Array.from(document.querySelectorAll('select'));
-    const periodSelect = selects.find(sel => {
-      const opts = Array.from(sel.options).map(o => o.value);
-      return opts.some(v => /^\d{6}$/.test(v));
-    });
-    if (!periodSelect) return false;
+    for (const sel of selects) {
+      const opts = Array.from(sel.options);
+      if (!opts.some(o => /\d{6}/.test(o.value + o.text))) continue;
+      const opt = opts.find(o => o.value.includes(period) || o.text.includes(period));
+      if (opt) {
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        return { method: 'native-select', value: opt.value, text: opt.text };
+      }
+    }
 
-    // Check if this period exists as an option
-    const option = Array.from(periodSelect.options).find(o => o.value === period || o.text.includes(period));
-    if (!option) return false;
+    // Try DevExpress combobox — look for ASPxComboBox elements
+    // They render as input + hidden select with id containing "ddl" or "BillingPeriod" or "Period"
+    const inputs = Array.from(document.querySelectorAll('input[id*="Period"], input[id*="period"], input[id*="ddl"]'));
+    for (const input of inputs) {
+      // Find the corresponding hidden select
+      const baseId = input.id.replace('_I', '');
+      const hiddenSel = document.querySelector('select[id*="' + baseId + '"]') ||
+                        document.querySelector('select[name*="Period"]') ||
+                        document.querySelector('select[name*="period"]');
+      if (hiddenSel) {
+        const opt = Array.from(hiddenSel.options).find(o => o.value.includes(period) || o.text.includes(period));
+        if (opt) {
+          hiddenSel.value = opt.value;
+          hiddenSel.dispatchEvent(new Event('change', { bubbles: true }));
+          input.value = opt.text;
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          // Trigger ASPx change
+          try { ASPx.EValueChanged(baseId); } catch(e) {}
+          return { method: 'dxcombo', value: opt.value, text: opt.text };
+        }
+      }
+    }
 
-    periodSelect.value = option.value;
-    periodSelect.dispatchEvent(new Event('change', { bubbles: true }));
-    return true;
+    // Last resort — find ANY element containing the period value and click it
+    const allOptions = Array.from(document.querySelectorAll('option, li, td'));
+    const match = allOptions.find(el => el.textContent.trim().includes(period));
+    if (match) {
+      match.click();
+      return { method: 'click', text: match.textContent.trim() };
+    }
+
+    // Return what dropdowns/selects we found for debugging
+    const found = selects.map(s => ({
+      id: s.id,
+      name: s.name,
+      opts: Array.from(s.options).slice(0,5).map(o => o.value + ':' + o.text)
+    }));
+    return { method: 'none', debug: found };
   }, period);
 
-  console.log(`[cdrs] Period selected: ${periodSelected}`);
+  console.log(`[cdrs] Period result:`, JSON.stringify(periodResult));
 
-  if (!periodSelected) {
-    return { found: false, reason: `Billing period ${period} not found in dropdown` };
+  if (!periodResult || periodResult.method === 'none') {
+    // Try clicking the DevExpress dropdown button to open it, then select
+    const clicked = await sessionPage.evaluate((period) => {
+      // DevExpress comboboxes have a button with class dxb or similar
+      const btns = Array.from(document.querySelectorAll('td[class*="dxb"], button[class*="dx"], img[class*="dxeB"]'));
+      for (const btn of btns) {
+        const parent = btn.closest('table') || btn.parentElement;
+        if (!parent) continue;
+        const text = parent.textContent;
+        if (/\d{6}/.test(text) || /period|billing/i.test(parent.id || '')) {
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    }, period);
+
+    if (clicked) {
+      await sleep(2000);
+      // Now try to find and click the period in the opened dropdown list
+      await sessionPage.evaluate((period) => {
+        const items = Array.from(document.querySelectorAll('td.dxeListBoxItem_MetropolisBlue, li, td[class*="List"]'));
+        const match = items.find(el => el.textContent.includes(period));
+        if (match) match.click();
+      }, period);
+      await sleep(4000);
+    } else {
+      return { found: false, reason: 'Could not find or interact with billing period dropdown. Debug: ' + JSON.stringify(periodResult) };
+    }
+  } else {
+    // Period was selected via select/combo — wait for postback
+    await sleep(6000);
   }
 
-  // Wait for grid to reload with the selected period
-  await sleep(5000);
-
-  // Extract CDR rows
+  // Extract CDR rows from the grid
   const rows = await sessionPage.evaluate(() => {
     const result = [];
-
-    // Find all data rows in the DevExpress grid
     for (const row of document.querySelectorAll('tr')) {
       const cells = Array.from(row.querySelectorAll('td.dxgv'));
       if (cells.length < 8) continue;
       const values = cells.map(c => c.textContent.trim());
-      // Skip header-like rows and "no data" rows
-      if (values[0].includes('No data') || values[0].includes('Loading')) continue;
-      // CDR rows start with an ICCID-like number or service type
-      if (values.length >= 10) {
-        result.push({
-          iccid:      values[0]  || '',
-          product:    values[1]  || '',
-          service:    values[2]  || '',
-          originNum:  values[3]  || '',
-          originCtry: values[4]  || '',
-          destNum:    values[5]  || '',
-          network:    values[6]  || '',
-          country:    values[7]  || '',
-          startCDR:   values[8]  || '',
-          endCDR:     values[9]  || '',
-          volData:    values[10] || '0',
-          volMin:     values[11] || '0',
-          volMsg:     values[12] || '0',
-          cdrMoney:   values[13] || '0',
-          cdrData:    values[14] || '0',
-          cdrMin:     values[15] || '0',
-          cdrMsg:     values[16] || '0',
-          currency:   values[17] || '',
-          cdrTotal:   values[18] || '0',
-          inBundle:   values[19] || ''
-        });
-      }
+      if (!values[0] || values[0].includes('No data') || values[0].includes('Loading')) continue;
+      result.push({
+        iccid:      values[0]  || '',
+        product:    values[1]  || '',
+        service:    values[2]  || '',
+        originNum:  values[3]  || '',
+        originCtry: values[4]  || '',
+        destNum:    values[5]  || '',
+        network:    values[6]  || '',
+        country:    values[7]  || '',
+        startCDR:   values[8]  || '',
+        endCDR:     values[9]  || '',
+        volData:    values[10] || '0',
+        volMin:     values[11] || '0',
+        volMsg:     values[12] || '0',
+        cdrMoney:   values[13] || '0',
+        cdrData:    values[14] || '0',
+        cdrMin:     values[15] || '0',
+        cdrMsg:     values[16] || '0',
+        currency:   values[17] || '',
+        cdrTotal:   values[18] || '0',
+        inBundle:   values[19] || ''
+      });
     }
-
     return result;
   });
 
