@@ -1,6 +1,6 @@
 /**
- * Satellite SIM Balance API
- * Scrapes IBIS GlobalBeam portal to return prepay balance + expiry for a given ICCID.
+ * Satellite SIM Balance + CDR API
+ * Scrapes IBIS GlobalBeam portal for prepay balance, expiry, and CDRs.
  * Deploy on Railway.app (set IBIS_USERNAME and IBIS_PASSWORD env vars).
  */
 
@@ -9,23 +9,20 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const rateLimit = require('express-rate-limit');
 
-// Make Puppeteer look like a real browser — prevents bot detection on login
 puppeteer.use(StealthPlugin());
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const PORTAL_LOGIN  = 'https://ibisglobalbeam.satcomhost.com/Account/Login';
+const PORTAL_LOGIN    = 'https://ibisglobalbeam.satcomhost.com/Account/Login';
 const PORTAL_SIMCARDS = 'https://ibisglobalbeam.satcomhost.com/SimcardsSimple.aspx';
+const PORTAL_CDRS     = 'https://ibisglobalbeam.satcomhost.com/RatedCdrs.aspx';
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
 app.use(express.json());
-
-// Required for express-rate-limit to work correctly behind Railway's proxy
 app.set('trust proxy', 1);
 
-// Allow all origins so Wix embeds can call the API
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -34,7 +31,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// 20 lookups per minute per IP – prevents abuse
 app.use('/api/', rateLimit({
   windowMs: 60 * 1000,
   max: 20,
@@ -67,7 +63,6 @@ async function launchBrowser() {
 }
 
 async function doLogin() {
-  // Prevent parallel login attempts
   if (loginLock) {
     console.log('[login] Waiting for existing login to finish...');
     for (let i = 0; i < 15; i++) {
@@ -90,66 +85,51 @@ async function doLogin() {
 
     console.log('[login] Navigating to login page...');
     await sessionPage.goto(PORTAL_LOGIN, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-    // Wait for the username field to appear
     await sessionPage.waitForSelector('input[type="text"], input[name="UserName"]', { timeout: 15000 });
 
-    // Find the exact selectors present on the page
     const { userSel, passSel } = await sessionPage.evaluate(() => {
       const u =
-        document.querySelector('input[name="UserName"]')  ? 'input[name="UserName"]'  :
-        document.querySelector('input[name="Username"]')  ? 'input[name="Username"]'  :
-        document.querySelector('input[id*="UserName"]')   ? 'input[id*="UserName"]'   :
+        document.querySelector('input[name="UserName"]') ? 'input[name="UserName"]' :
+        document.querySelector('input[name="Username"]') ? 'input[name="Username"]' :
+        document.querySelector('input[id*="UserName"]')  ? 'input[id*="UserName"]'  :
         'input[type="text"]';
       const p =
-        document.querySelector('input[name="Password"]')  ? 'input[name="Password"]'  :
-        document.querySelector('input[id*="Password"]')   ? 'input[id*="Password"]'   :
+        document.querySelector('input[name="Password"]') ? 'input[name="Password"]' :
+        document.querySelector('input[id*="Password"]')  ? 'input[id*="Password"]'  :
         'input[type="password"]';
       return { userSel: u, passSel: p };
     });
 
-    console.log('[login] Using selectors:', userSel, passSel);
-
-    // Use Puppeteer type() to simulate real keystrokes (more reliable than setting .value)
     await sessionPage.click(userSel, { clickCount: 3 });
     await sessionPage.type(userSel, process.env.IBIS_USERNAME || '', { delay: 50 });
-
     await sessionPage.click(passSel);
     await sessionPage.type(passSel, process.env.IBIS_PASSWORD || '', { delay: 50 });
 
-    console.log('[login] Credentials typed, submitting...');
-
-    // Submit via Enter key and wait for page to settle
+    console.log('[login] Submitting...');
     await sessionPage.keyboard.press('Enter');
-    await sleep(8000); // wait for the redirect to complete
+    await sleep(8000);
 
     const url = sessionPage.url();
     console.log('[login] Post-submit URL:', url);
 
     if (url.toLowerCase().includes('login')) {
-      // Log any error message visible on the page to help diagnose
       const pageError = await sessionPage.evaluate(() => {
         const el = document.querySelector('.validation-summary-errors, .text-danger, [class*="error"], [class*="alert"]');
         return el ? el.textContent.trim() : 'No error message found on page';
       });
-      console.log('[login] Page error message:', pageError);
-      throw new Error('Login failed – credentials rejected by IBIS site. Page says: ' + pageError);
+      throw new Error('Login failed: ' + pageError);
     }
 
     isLoggedIn = true;
-    console.log('[login] Success. URL:', url);
+    console.log('[login] Success');
   } finally {
     loginLock = false;
   }
 }
 
 async function ensureLoggedIn() {
-  if (!sessionPage || sessionPage.isClosed()) {
-    isLoggedIn = false;
-  }
-  if (!isLoggedIn) {
-    await doLogin();
-  }
+  if (!sessionPage || sessionPage.isClosed()) isLoggedIn = false;
+  if (!isLoggedIn) await doLogin();
 }
 
 // ─── Balance lookup ───────────────────────────────────────────────────────────
@@ -157,45 +137,35 @@ async function ensureLoggedIn() {
 async function lookupSIM(iccid) {
   await ensureLoggedIn();
 
-  console.log(`[lookup] Navigating to SIM cards page for ICCID: ${iccid}`);
+  console.log(`[lookup] SIM: ${iccid}`);
   await sessionPage.goto(PORTAL_SIMCARDS, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
   if (sessionPage.url().toLowerCase().includes('login')) {
-    console.log('[lookup] Session expired – re-logging in...');
     isLoggedIn = false;
     await ensureLoggedIn();
     await sessionPage.goto(PORTAL_SIMCARDS, { waitUntil: 'domcontentloaded', timeout: 60000 });
   }
 
-  // Wait for the DevExpress grid filter input to appear
-  // Exact selector from inspecting the page: input id contains "DXFREditorcol0"
   await sessionPage.waitForSelector('input[id*="DXFREditorcol0"]', { timeout: 15000 });
-  console.log('[lookup] Grid filter input found');
 
-  // Clear the filter and type the ICCID
   const filterInput = await sessionPage.$('input[id*="DXFREditorcol0"]');
   await filterInput.click({ clickCount: 3 });
   await filterInput.type(iccid, { delay: 40 });
 
-  // Trigger the DevExpress filter change event then press Enter
   await sessionPage.evaluate(() => {
     const input = document.querySelector('input[id*="DXFREditorcol0"]');
     if (input) {
       input.dispatchEvent(new Event('change', { bubbles: true }));
       if (typeof ASPx !== 'undefined' && input.id) {
-        const baseId = input.id.replace('_I', '');
-        try { ASPx.EValueChanged(baseId); } catch(e) {}
+        try { ASPx.EValueChanged(input.id.replace('_I', '')); } catch(e) {}
       }
     }
   });
 
   await sessionPage.keyboard.press('Enter');
-  await sleep(5000); // wait for DevExpress grid to reload
+  await sleep(5000);
 
-  // ── Extract results using exact DevExpress class selectors ──────────────────
   const result = await sessionPage.evaluate(() => {
-    // Data rows in a DevExpress grid have cells with class "dxgv"
-    // Find the first row with 10+ dxgv cells that isn't a "no data" row
     let dataRow = null;
     for (const row of document.querySelectorAll('tr')) {
       const cells = row.querySelectorAll('td.dxgv');
@@ -206,29 +176,22 @@ async function lookupSIM(iccid) {
       break;
     }
 
-    if (!dataRow) return { found: false, reason: 'No dxgv data row found after filter' };
+    if (!dataRow) return { found: false, reason: 'No data row found after filter' };
 
-    // ── Exact cell extraction ──
-    // Expiry: the last td.dxgv — it has style="border-right-width:0px" (no right border = last col)
-    const expiryCell = dataRow.querySelector('td.dxgv[style*="border-right-width:0px"]');
-    const expiry = expiryCell ? expiryCell.textContent.trim() : 'N/A';
-
-    // Balance: td.dxgv with align="right" that is immediately before the expiry cell
+    const expiryCell  = dataRow.querySelector('td.dxgv[style*="border-right-width:0px"]');
+    const expiry      = expiryCell ? expiryCell.textContent.trim() : 'N/A';
     const balanceCell = expiryCell ? expiryCell.previousElementSibling : null;
-    const balance = balanceCell ? balanceCell.textContent.trim() : '0';
+    const balance     = balanceCell ? balanceCell.textContent.trim() : '0';
+    const values      = Array.from(dataRow.querySelectorAll('td.dxgv')).map(c => c.textContent.trim());
 
-    // All cell values for pattern-matching other fields
-    const values = Array.from(dataRow.querySelectorAll('td.dxgv')).map(c => c.textContent.trim());
-    console.log('[extract] values:', JSON.stringify(values));
-
-    const iccid    = values.find(v => /^\d{17,22}$/.test(v)) || '';
-    const msisdn   = values.find(v => /^\d{10,16}$/.test(v) && v !== iccid) || '';
-    const status   = values.find(v => /^(Activated|Expired|Not Activated|Active|Inactive|Suspended)$/i.test(v)) || 'Unknown';
-    const product  = values.find(v => /^[A-Z]{2,6}$/.test(v)) || '';
-    const location = values.find(v => /^[A-Z]{2,3}$/.test(v) && v !== product) || '';
-    const dates    = values.filter(v => /^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/.test(v));
-    const lastUsed = dates[0] || 'N/A';
-    const planName = values.find(v => v.length > 5 && (v.toLowerCase().includes('plan') || v.toLowerCase().includes('prepay'))) || '';
+    const iccid   = values.find(v => /^\d{17,22}$/.test(v)) || '';
+    const msisdn  = values.find(v => /^\d{10,16}$/.test(v) && v !== iccid) || '';
+    const status  = values.find(v => /^(Activated|Expired|Not Activated|Active|Inactive|Suspended)$/i.test(v)) || 'Unknown';
+    const product = values.find(v => /^[A-Z]{2,6}$/.test(v)) || '';
+    const location= values.find(v => /^[A-Z]{2,3}$/.test(v) && v !== product) || '';
+    const dates   = values.filter(v => /^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$/.test(v));
+    const lastUsed= dates[0] || 'N/A';
+    const planName= values.find(v => v.length > 5 && (v.toLowerCase().includes('plan') || v.toLowerCase().includes('prepay'))) || '';
 
     return { found: true, iccid, msisdn, product, status, location, lastUsed, expiry, balance, planName };
   });
@@ -237,36 +200,120 @@ async function lookupSIM(iccid) {
   return result;
 }
 
+// ─── CDR lookup ───────────────────────────────────────────────────────────────
+
+async function lookupCDRs(iccid, period) {
+  await ensureLoggedIn();
+
+  console.log(`[cdrs] ICCID: ${iccid}, Period: ${period}`);
+
+  // Navigate directly to CDR page for this ICCID
+  const cdrUrl = `${PORTAL_CDRS}?FC=ICCID&FV=${encodeURIComponent(iccid)}`;
+  await sessionPage.goto(cdrUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  if (sessionPage.url().toLowerCase().includes('login')) {
+    isLoggedIn = false;
+    await ensureLoggedIn();
+    await sessionPage.goto(cdrUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  }
+
+  // Wait for billing period dropdown
+  await sessionPage.waitForSelector('select', { timeout: 15000 });
+  await sleep(2000);
+
+  // Find and select the billing period dropdown
+  const periodSelected = await sessionPage.evaluate((period) => {
+    // Find all selects and look for the one with period-like options (YYYYMM format)
+    const selects = Array.from(document.querySelectorAll('select'));
+    const periodSelect = selects.find(sel => {
+      const opts = Array.from(sel.options).map(o => o.value);
+      return opts.some(v => /^\d{6}$/.test(v));
+    });
+    if (!periodSelect) return false;
+
+    // Check if this period exists as an option
+    const option = Array.from(periodSelect.options).find(o => o.value === period || o.text.includes(period));
+    if (!option) return false;
+
+    periodSelect.value = option.value;
+    periodSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }, period);
+
+  console.log(`[cdrs] Period selected: ${periodSelected}`);
+
+  if (!periodSelected) {
+    return { found: false, reason: `Billing period ${period} not found in dropdown` };
+  }
+
+  // Wait for grid to reload with the selected period
+  await sleep(5000);
+
+  // Extract CDR rows
+  const rows = await sessionPage.evaluate(() => {
+    const result = [];
+
+    // Find all data rows in the DevExpress grid
+    for (const row of document.querySelectorAll('tr')) {
+      const cells = Array.from(row.querySelectorAll('td.dxgv'));
+      if (cells.length < 8) continue;
+      const values = cells.map(c => c.textContent.trim());
+      // Skip header-like rows and "no data" rows
+      if (values[0].includes('No data') || values[0].includes('Loading')) continue;
+      // CDR rows start with an ICCID-like number or service type
+      if (values.length >= 10) {
+        result.push({
+          iccid:      values[0]  || '',
+          product:    values[1]  || '',
+          service:    values[2]  || '',
+          originNum:  values[3]  || '',
+          originCtry: values[4]  || '',
+          destNum:    values[5]  || '',
+          network:    values[6]  || '',
+          country:    values[7]  || '',
+          startCDR:   values[8]  || '',
+          endCDR:     values[9]  || '',
+          volData:    values[10] || '0',
+          volMin:     values[11] || '0',
+          volMsg:     values[12] || '0',
+          cdrMoney:   values[13] || '0',
+          cdrData:    values[14] || '0',
+          cdrMin:     values[15] || '0',
+          cdrMsg:     values[16] || '0',
+          currency:   values[17] || '',
+          cdrTotal:   values[18] || '0',
+          inBundle:   values[19] || ''
+        });
+      }
+    }
+
+    return result;
+  });
+
+  console.log(`[cdrs] Found ${rows.length} CDR rows`);
+  return { found: true, rows };
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', loggedIn: isLoggedIn, timestamp: new Date().toISOString() });
 });
 
+// Balance endpoint (existing — unchanged)
 app.post('/api/balance', async (req, res) => {
   const { iccid } = req.body || {};
-
-  if (!iccid || typeof iccid !== 'string') {
+  if (!iccid || typeof iccid !== 'string')
     return res.status(400).json({ error: 'iccid is required.' });
-  }
 
   const clean = iccid.replace(/\s+/g, '');
-
-  if (!/^\d{15,22}$/.test(clean)) {
-    return res.status(400).json({
-      error: 'Invalid ICCID format. Must be 15–22 digits (no spaces or dashes).'
-    });
-  }
+  if (!/^\d{15,22}$/.test(clean))
+    return res.status(400).json({ error: 'Invalid ICCID format. Must be 15–22 digits.' });
 
   try {
     const data = await lookupSIM(clean);
-
-    if (!data.found) {
-      return res.status(404).json({
-        error: 'SIM card not found. Check the ICCID and try again.',
-        detail: data.reason
-      });
-    }
+    if (!data.found)
+      return res.status(404).json({ error: 'SIM card not found.', detail: data.reason });
 
     return res.json({
       iccid:    data.iccid    || clean,
@@ -275,20 +322,46 @@ app.post('/api/balance', async (req, res) => {
       status:   data.status   || 'Unknown',
       balance:  data.balance  || '0',
       expiry:   data.expiry   || 'N/A',
-      plan:     data.planName || data.subscriptionName || '',
+      plan:     data.planName || '',
       lastUsed: data.lastUsed || 'N/A',
       location: data.location || ''
     });
-
   } catch (err) {
-    console.error('[api] Error:', err.message);
-
-    // Reset session so next request retries login cleanly
+    console.error('[api/balance] Error:', err.message);
     isLoggedIn = false;
+    return res.status(500).json({ error: 'Failed to retrieve balance. Please try again.' });
+  }
+});
 
-    return res.status(500).json({
-      error: 'Failed to retrieve balance. Please try again in a moment.'
+// CDR endpoint (new)
+app.post('/api/cdrs', async (req, res) => {
+  const { iccid, period } = req.body || {};
+
+  if (!iccid || typeof iccid !== 'string')
+    return res.status(400).json({ error: 'iccid is required.' });
+  if (!period || typeof period !== 'string' || !/^\d{6}$/.test(period))
+    return res.status(400).json({ error: 'period is required in YYYYMM format (e.g. 202603).' });
+
+  const clean = iccid.replace(/\s+/g, '');
+  if (!/^\d{15,22}$/.test(clean))
+    return res.status(400).json({ error: 'Invalid ICCID format. Must be 15–22 digits.' });
+
+  try {
+    const data = await lookupCDRs(clean, period);
+
+    if (!data.found)
+      return res.status(404).json({ error: 'No CDR data found.', detail: data.reason });
+
+    return res.json({
+      iccid:  clean,
+      period: period,
+      count:  data.rows.length,
+      rows:   data.rows
     });
+  } catch (err) {
+    console.error('[api/cdrs] Error:', err.message);
+    isLoggedIn = false;
+    return res.status(500).json({ error: 'Failed to retrieve CDRs. Please try again.' });
   }
 });
 
@@ -296,21 +369,16 @@ app.post('/api/balance', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[server] Listening on port ${PORT}`);
-
-  // Warm up: log in at startup so the first user request is fast
   ensureLoggedIn().catch(err => {
     console.error('[startup] Initial login failed:', err.message);
   });
 });
 
-// Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('[server] Shutting down...');
   if (browser) await browser.close();
   process.exit(0);
 });
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
