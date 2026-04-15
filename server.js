@@ -217,6 +217,179 @@ async function lookupCDRs(iccid, period) {
     await sessionPage.goto(cdrUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   }
 
+  // Wait for page to settle and grid to render
+  await sleep(5000);
+
+  // Log what dropdowns/selects exist on the page for debugging
+  const pageInfo = await sessionPage.evaluate(() => {
+    const selects = Array.from(document.querySelectorAll('select')).map(s => ({
+      id: s.id, name: s.name,
+      options: Array.from(s.options).map(o => ({ value: o.value, text: o.text }))
+    }));
+    const inputs = Array.from(document.querySelectorAll('input[id*="Period"], input[id*="period"], input[id*="Billing"], input[id*="ddl"]')).map(i => ({ id: i.id, value: i.value }));
+    return { selects, inputs, url: window.location.href };
+  });
+  console.log('[cdrs] Page selects:', JSON.stringify(pageInfo.selects));
+  console.log('[cdrs] Period inputs:', JSON.stringify(pageInfo.inputs));
+
+  // Try to select the period using multiple strategies
+  const periodResult = await sessionPage.evaluate((period) => {
+    // Strategy 1: native <select> with period options
+    const selects = Array.from(document.querySelectorAll('select'));
+    for (const sel of selects) {
+      const opts = Array.from(sel.options);
+      if (!opts.some(o => /\d{6}/.test(o.value + o.text))) continue;
+      // Find matching option — period value might be "202604 (current period)" etc
+      const opt = opts.find(o =>
+        o.value === period ||
+        o.value.startsWith(period) ||
+        o.text.startsWith(period) ||
+        o.text.includes(period)
+      );
+      if (opt) {
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        try {
+          if (typeof ASPx !== 'undefined') ASPx.EValueChanged(sel.id.replace('_I',''));
+        } catch(e) {}
+        return { ok: true, method: 'select', value: opt.value, text: opt.text };
+      }
+      // Log available options for debugging
+      return { ok: false, method: 'select-no-match', available: opts.slice(0,10).map(o => o.value + '|' + o.text) };
+    }
+
+    // Strategy 2: DevExpress combobox input
+    const allInputs = Array.from(document.querySelectorAll('input'));
+    for (const inp of allInputs) {
+      if (!inp.id) continue;
+      // Look for inputs that look like they hold a period value
+      if (/\d{6}/.test(inp.value) || /period|billing|ddl/i.test(inp.id)) {
+        const baseId = inp.id.replace('_I', '');
+        // Find associated hidden select
+        const hiddenSel = document.querySelector('#' + baseId + '_B') ||
+                          document.querySelector('select[name*="' + baseId + '"]');
+        if (hiddenSel) {
+          const opts = Array.from(hiddenSel.options);
+          const opt = opts.find(o => o.value.includes(period) || o.text.includes(period));
+          if (opt) {
+            hiddenSel.value = opt.value;
+            hiddenSel.dispatchEvent(new Event('change', { bubbles: true }));
+            try { ASPx.EValueChanged(baseId); } catch(e) {}
+            return { ok: true, method: 'dxcombo', value: opt.value };
+          }
+        }
+      }
+    }
+
+    return { ok: false, method: 'none' };
+  }, period);
+
+  console.log('[cdrs] Period selection:', JSON.stringify(periodResult));
+
+  if (periodResult.ok) {
+    // Period selected — wait for grid to reload
+    await sleep(8000);
+  } else {
+    // Try clicking the DevExpress dropdown to open it
+    console.log('[cdrs] Trying click approach...');
+    await sessionPage.evaluate((period) => {
+      // Find dropdown button — DevExpress renders as a button image
+      const btns = Array.from(document.querySelectorAll('img, td, button')).filter(el => {
+        const cls = el.className || '';
+        return cls.includes('dxb') || cls.includes('dxeB') || cls.includes('combo');
+      });
+      if (btns[0]) btns[0].click();
+    }, period);
+    await sleep(2000);
+
+    // Click the matching item in opened list
+    const clicked = await sessionPage.evaluate((period) => {
+      const items = Array.from(document.querySelectorAll('td, li, div')).filter(el => {
+        const cls = el.className || '';
+        return (cls.includes('List') || cls.includes('Item') || cls.includes('dxe')) &&
+               el.textContent.trim().includes(period);
+      });
+      if (items[0]) { items[0].click(); return items[0].textContent.trim(); }
+      return null;
+    }, period);
+
+    console.log('[cdrs] Clicked item:', clicked);
+    await sleep(8000);
+  }
+
+  // Wait for loading to clear
+  console.log('[cdrs] Waiting for grid render...');
+  for (let i = 0; i < 20; i++) {
+    await sleep(2000);
+    const stillLoading = await sessionPage.evaluate(() => {
+      return Array.from(document.querySelectorAll('td.dxgv')).some(c => c.innerText && c.innerText.includes('Loading'));
+    });
+    if (!stillLoading) { console.log(`[cdrs] Grid ready after ${(i+1)*2}s`); break; }
+  }
+
+  // Extract CDR rows — filter out script/comment/calendar content
+  const rows = await sessionPage.evaluate(() => {
+    const result = [];
+    for (const row of document.querySelectorAll('tr')) {
+      const cells = Array.from(row.querySelectorAll('td.dxgv'));
+      if (cells.length < 8) continue;
+
+      // Get clean text from each cell — remove scripts
+      const values = cells.map(c => {
+        const clone = c.cloneNode(true);
+        clone.querySelectorAll('script,style,noscript').forEach(el => el.remove());
+        const txt = (clone.innerText || clone.textContent || '').trim().replace(/\s+/g, ' ');
+        return txt;
+      });
+
+      const joined = values.join('|');
+      if (joined.includes('ASPx') || joined.includes('<!--') || joined.includes('function(')) continue;
+      if (joined.includes('SunMon') || joined.includes('Loading')) continue;
+      if (!values[0] || values[0].length < 2) continue;
+
+      result.push({
+        iccid:      values[0]  || '',
+        product:    values[1]  || '',
+        service:    values[2]  || '',
+        originNum:  values[3]  || '',
+        originCtry: values[4]  || '',
+        destNum:    values[5]  || '',
+        network:    values[6]  || '',
+        country:    values[7]  || '',
+        startCDR:   values[8]  || '',
+        endCDR:     values[9]  || '',
+        volData:    values[10] || '0',
+        volMin:     values[11] || '0',
+        volMsg:     values[12] || '0',
+        cdrMoney:   values[13] || '0',
+        cdrData:    values[14] || '0',
+        cdrMin:     values[15] || '0',
+        cdrMsg:     values[16] || '0',
+        currency:   values[17] || '',
+        cdrTotal:   values[18] || '0',
+        inBundle:   values[19] || ''
+      });
+    }
+    return result;
+  });
+
+  console.log(`[cdrs] Found ${rows.length} CDR rows`);
+  if (rows.length > 0) console.log('[cdrs] First row:', JSON.stringify(rows[0]));
+  return { found: true, rows };
+}
+
+  console.log(`[cdrs] ICCID: ${iccid}, Period: ${period}`);
+
+  // Navigate directly to CDR page for this ICCID
+  const cdrUrl = `${PORTAL_CDRS}?FC=ICCID&FV=${encodeURIComponent(iccid)}`;
+  await sessionPage.goto(cdrUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  if (sessionPage.url().toLowerCase().includes('login')) {
+    isLoggedIn = false;
+    await ensureLoggedIn();
+    await sessionPage.goto(cdrUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  }
+
   // Wait for page to settle
   await sleep(4000);
 
